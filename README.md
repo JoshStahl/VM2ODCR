@@ -1,4 +1,4 @@
-# VM2ODCR — Adding an existing Azure VM to an On-Demand Capacity Reservation (ODCR)
+# VM2ODCR: Adding an existing Azure VM to an On-Demand Capacity Reservation (ODCR)
 
 Working, tested code for protecting a VM with an On-Demand Capacity Reservation, in **Azure CLI
 (bash)**, **PowerShell (Az)**, **Terraform** (`azurerm` and `azapi`) and **Bicep**, following the
@@ -6,7 +6,7 @@ low-risk pattern from
 [Demystifying On-Demand Capacity Reservations](https://techcommunity.microsoft.com/blog/azureinfrastructureblog/demystifying-on-demand-capacity-reservations/4504806).
 
 > **Status of this repo.** Examples were run against a real subscription unless the table in
-> [What was tested](#what-was-tested) says otherwise. One step could not be completed in our lab:
+> [What was tested](#what-was-tested) says otherwise. One step could not be completed in the original lab:
 > raising a reservation from 0 to 1 failed with `SkuNotAvailable`. See
 > [Capacity and `SkuNotAvailable`](#capacity-and-skunotavailable).
 
@@ -133,14 +133,14 @@ Real Azure subscription, eastus2, zone 1, `Standard_D2s_v5`, reservation quantit
 | Example | Result |
 |---|---|
 | bash 01 to 03, 05, 99 | Passed. Verify correctly reports "NOT protected" at quantity 0. Cleanup finished in one pass |
-| PowerShell | **Not run live** (Az PowerShell needed interactive MFA we could not complete). Every cmdlet and parameter in the script was validated against the installed Az.Compute 11.6; `-Sku` is a string and `-Location`, `-CapacityToReserve` are mandatory |
+| PowerShell | Review lab: creation, association, increase to one, target VM verification and synchronous group cleanup passed in West US 2, zone 2. Behavioral tests cover allocation failure, cleanup failure and existing group refusal on PowerShell 5.1 and 7. |
 | Terraform `azurerm` fresh | apply, clean plan, single-pass destroy |
 | Terraform `azapi` fresh | apply, clean plan (needs `ignore_casing`), single-pass destroy (needs `retry` on the CRG) |
-| Terraform `adopt-azapi` | apply, clean plan, VM kept tags/config and stayed running; single-pass destroy left the VM running and detached |
+| Terraform `adopt-azapi` | apply and clean plan kept tags/config and the VM stayed running. Teardown requires an explicit VM detach before removing reservation resources. |
 | Terraform `adopt-azurerm` | import, in-place association, clean plan, and the safe-undo path. A plain `destroy` **deletes the VM** |
 | Bicep fresh | deploy, idempotent redeploy, names derived from `vmName` |
 | Bicep adopt | what-if, deploy; identity, boot diagnostics and tags preserved, VM stayed running |
-| **Raising quantity 0 to 1** | **Failed (`SkuNotAvailable`) in our lab**, see above. Not tested successfully anywhere in this repo |
+| **Raising quantity 0 to 1** | Failed in the original lab. Succeeded in the review lab in West US 2, zone 2, for PowerShell, the AzAPI fresh build and AzAPI adoption. |
 
 ## Cleanup
 
@@ -153,6 +153,23 @@ az group delete -n <rg> --yes --no-wait
 ```
 
 A reservation with quantity above 0 **bills immediately** at the VM's rate, so remove it when finished.
+
+PowerShell `-Cleanup` requires a new resource group and waits for deletion on success or failure.
+It refuses an existing group to avoid deleting unrelated resources. Without `-Cleanup`, the lab remains for inspection.
+
+AzAPI adoption requires explicit detach before destroy. See its README, including the state migration instruction
+if you already applied the previous automatic detach action.
+
+## Behavioral tests
+
+These tests use controlled Azure responses and do not deploy resources:
+
+```bash
+pwsh -NoProfile -File tests/Test-Walkthrough.ps1
+bash tests/test-verify.sh
+```
+
+The PowerShell test also runs with Windows PowerShell 5.1. Live validation verifies real Azure behavior separately.
 
 ---
 

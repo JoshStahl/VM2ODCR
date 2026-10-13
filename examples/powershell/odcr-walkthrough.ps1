@@ -1,5 +1,5 @@
 <#
-    VM2ODCR — PowerShell (Az module) walkthrough.
+    VM2ODCR: PowerShell (Az module) walkthrough.
 
     Adds an EXISTING VM to an On-Demand Capacity Reservation using the low-risk
     order: create CRG + reservation (qty 0) -> associate running VM -> raise qty -> verify.
@@ -28,9 +28,29 @@ $ErrorActionPreference = 'Stop'
 $CrgName = "crg-$VmName"
 $ResName = "res-$($VmSize -replace '^Standard_','')-z$(if ($Zone) { $Zone } else { 'regional' })"
 $zoneArgs = if ($Zone) { @{ Zone = $Zone } } else { @{} }
+$createdResourceGroup = $false
+
+# Cleanup is safe only when this invocation created the resource group.
+trap {
+    $walkthroughFailure = $_
+    if ($Cleanup -and $createdResourceGroup) {
+        try {
+            Remove-AzResourceGroup -Name $Rg -Force -ErrorAction Stop | Out-Null
+            Write-Warning "The walkthrough failed. Cleanup completed for $Rg."
+        }
+        catch {
+            Write-Warning "Cleanup failed for ${Rg}: $($_.Exception.Message). Delete this lab group manually."
+        }
+    }
+    throw $walkthroughFailure
+}
 
 # ---- Step 1: Resource group + small VM -------------------------------------
+if ($Cleanup -and (Get-AzResourceGroup -ErrorAction Stop | Where-Object { $_.ResourceGroupName -eq $Rg })) {
+    throw "-Cleanup requires a new resource group. $Rg already exists."
+}
 New-AzResourceGroup -Name $Rg -Location $Location -Force | Out-Null
+$createdResourceGroup = $true
 
 # Prompt for the local admin credential (password auth for brevity) unless supplied.
 $cred = if ($Credential) { $Credential } else { Get-Credential -UserName $AdminUser -Message 'Enter a password for the VM admin user' }
@@ -92,29 +112,23 @@ Update-AzCapacityReservation `
 # ---- Verify: do not call the VM protected until all of this is true --------
 $cr = Get-AzCapacityReservation -ResourceGroupName $Rg -ReservationGroupName $CrgName -Name $ResName -InstanceView
 $allocated = @($cr.InstanceView.UtilizationInfo.VirtualMachinesAllocated)
+$targetVmId = (Get-AzVM -ResourceGroupName $Rg -Name $VmName).Id
+$targetAllocated = @($allocated | Where-Object { $_.Id -eq $targetVmId })
 [pscustomobject]@{
     Sku             = $cr.Sku.Name
     Zone            = ($cr.Zones -join ',')
     Capacity        = $cr.Sku.Capacity
     CurrentCapacity = $cr.InstanceView.UtilizationInfo.CurrentCapacity
+    AllocatedVMCount = $allocated.Count
     AllocatedVMs    = ($allocated.Id -join ';')
 } | Format-List
 
-if ($cr.Sku.Capacity -ge 1 -and $allocated.Count -ge 1) { Write-Host 'RESULT: protected.' }
-else { Write-Host 'RESULT: NOT protected yet (capacity 0 or VM not in virtualMachinesAllocated).' }
+if ($cr.Sku.Capacity -ge $allocated.Count -and $cr.InstanceView.UtilizationInfo.CurrentCapacity -ge $allocated.Count -and $targetAllocated.Count -eq 1) { Write-Host 'RESULT: protected.' }
+else { Write-Host 'RESULT: NOT protected yet (capacity is insufficient or this VM is not in virtualMachinesAllocated).' }
 
 # ---- Cleanup (pass -Cleanup) -----------------------------------------------
-# Reservation delete returns 409 while a VM is still associated, so delete the VM first.
+# This walkthrough created every resource in the group. Group deletion handles provider ordering.
 if ($Cleanup) {
-    Remove-AzVM -ResourceGroupName $Rg -Name $VmName -Force | Out-Null
-    $deadline = (Get-Date).AddMinutes(5)
-    do {
-        $g = Get-AzCapacityReservationGroup -ResourceGroupName $Rg -Name $CrgName
-        if (-not $g.VirtualMachinesAssociated) { break }
-        Start-Sleep -Seconds 10
-    } while ((Get-Date) -lt $deadline)
-    Remove-AzCapacityReservation -ResourceGroupName $Rg -ReservationGroupName $CrgName -Name $ResName -Confirm:$false | Out-Null
-    Remove-AzCapacityReservationGroup -ResourceGroupName $Rg -Name $CrgName -Confirm:$false | Out-Null
-    Remove-AzResourceGroup -Name $Rg -Force -AsJob | Out-Null
-    Write-Host "Cleanup started for $Rg."
+    Remove-AzResourceGroup -Name $Rg -Force | Out-Null
+    Write-Host "Cleanup completed for $Rg."
 }

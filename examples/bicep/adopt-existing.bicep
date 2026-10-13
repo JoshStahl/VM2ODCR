@@ -1,5 +1,5 @@
 // =============================================================================
-// VM2ODCR — Bicep ADOPT an EXISTING running VM.
+// VM2ODCR: Bicep ADOPT an EXISTING running VM.
 //
 // Creates a CRG + reservation that match the VM, then deploys ONLY the association onto the
 // existing VM (properties.capacityReservation). Nothing else about the VM is restated.
@@ -33,21 +33,23 @@ param crgName string = 'crg-${vmName}'
 @description('Reserved instances. Default 0 = metadata only; raise to 1 after the VM is associated and verify.')
 param reservedCount int = 0
 
+var reservationSuffix = empty(zone) ? 'regional' : 'z${zone}'
+
 resource crg 'Microsoft.Compute/capacityReservationGroups@2024-07-01' = {
   name: crgName
   location: location
-  zones: [zone]
+  zones: empty(zone) ? null : [zone]
 }
 
 resource reservation 'Microsoft.Compute/capacityReservationGroups/capacityReservations@2024-07-01' = {
   parent: crg
-  name: 'res-${replace(vmSize, 'Standard_', '')}-z${zone}'
+  name: 'res-${replace(vmSize, 'Standard_', '')}-${reservationSuffix}'
   location: location
   sku: {
     name: vmSize
     capacity: reservedCount
   }
-  zones: [zone]
+  zones: empty(zone) ? null : [zone]
 }
 
 // Association only. `dependsOn` is REQUIRED: the VM references only crg.id, so without it Bicep
@@ -56,7 +58,7 @@ resource reservation 'Microsoft.Compute/capacityReservationGroups/capacityReserv
 resource vm 'Microsoft.Compute/virtualMachines@2024-07-01' = {
   name: vmName
   location: location
-  zones: [zone]
+  zones: empty(zone) ? null : [zone]
   dependsOn: [reservation]
   properties: {
     capacityReservation: {
