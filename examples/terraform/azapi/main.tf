@@ -8,8 +8,19 @@
 # Here the base VM + network are created with azurerm, the CRG + reservation are
 # created with azapi, and the association is done with `azapi_update_resource`
 # (a PATCH of properties.capacityReservation) so the VM is NOT bounced.
+#
+# Notes:
+#  - Zonal VM association without deallocation is a Microsoft Learn PREVIEW feature.
+#  - Azure echoes the CRG id with an UPPERCASE resource-group segment, which would make
+#    every later plan propose another PATCH. `ignore_casing = true` suppresses that drift.
+#  - Ordering: the VM depends_on the reservation so destroy deletes the VM first
+#    (otherwise Azure returns 409: the VM still references the reservation).
 # =============================================================================
 
+locals {
+  crg_name = "crg-${var.vm_name}"
+  res_name = "res-${replace(var.vm_size, "Standard_", "")}-z${var.zone}"
+}
 resource "azurerm_resource_group" "rg" {
   name     = var.resource_group_name
   location = var.location
@@ -74,23 +85,34 @@ resource "azurerm_linux_virtual_machine" "vm" {
   lifecycle {
     ignore_changes = [capacity_reservation_group_id]
   }
+
+  # Destroy the VM before the reservation (avoids 409). Create order is unaffected.
+  depends_on = [azapi_resource.res]
 }
 
 # --- Capacity Reservation Group (the bucket) via azapi ----------------------
 resource "azapi_resource" "crg" {
   type      = "Microsoft.Compute/capacityReservationGroups@2024-07-01"
-  name      = "crg-vm2odcr"
+  name      = local.crg_name
   parent_id = azurerm_resource_group.rg.id
   location  = azurerm_resource_group.rg.location
   body = {
     zones = [var.zone]
+  }
+
+  # Azure can still report the just-deleted reservation as a nested resource for a short time
+  # (409 CannotDeleteResource). Retry the CRG delete instead of needing a second `destroy`.
+  retry = {
+    error_message_regex  = ["CannotDeleteResource", "nested resources exist"]
+    interval_seconds     = 10
+    max_interval_seconds = 30
   }
 }
 
 # --- Capacity Reservation (the parking spaces) via azapi --------------------
 resource "azapi_resource" "res" {
   type      = "Microsoft.Compute/capacityReservationGroups/capacityReservations@2024-07-01"
-  name      = "res-D2s_v5-z1"
+  name      = local.res_name
   parent_id = azapi_resource.crg.id
   location  = azurerm_resource_group.rg.location
   body = {
@@ -104,8 +126,9 @@ resource "azapi_resource" "res" {
 
 # --- Nondisruptive association: PATCH the VM's capacityReservation ----------
 resource "azapi_update_resource" "associate" {
-  type        = "Microsoft.Compute/virtualMachines@2024-07-01"
-  resource_id = azurerm_linux_virtual_machine.vm.id
+  type          = "Microsoft.Compute/virtualMachines@2024-07-01"
+  resource_id   = azurerm_linux_virtual_machine.vm.id
+  ignore_casing = true
   body = {
     properties = {
       capacityReservation = {

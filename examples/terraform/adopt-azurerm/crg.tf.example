@@ -1,0 +1,65 @@
+# Step 3 of the adoption flow: the CRG + reservation. Add these AFTER the import plan shows
+# "0 to change", then set capacity_reservation_group_id on the imported VM (see README).
+#
+# Location, zone and size are INPUTS here, not read from azurerm_linux_virtual_machine.existing:
+# the VM depends on these resources, so referencing the VM would create a dependency cycle.
+# They MUST match the VM (a reservation only protects a VM with the same region, zone and size).
+
+variable "resource_group_name" {
+  type = string
+}
+
+variable "location" {
+  type    = string
+  default = "eastus2"
+}
+
+variable "zone" {
+  type    = string
+  default = "1"
+}
+
+variable "vm_size" {
+  type    = string
+  default = "Standard_D2s_v5"
+}
+
+variable "crg_name" {
+  type    = string
+  default = "crg-adopted"
+}
+
+variable "reservation_name" {
+  type    = string
+  default = "res-adopted"
+}
+
+variable "reserved_count" {
+  type    = number
+  default = 0
+}
+
+resource "azurerm_capacity_reservation_group" "crg" {
+  name                = var.crg_name
+  resource_group_name = var.resource_group_name
+  location            = var.location
+  zones               = [var.zone]
+}
+
+resource "azurerm_capacity_reservation" "res" {
+  name                          = var.reservation_name
+  capacity_reservation_group_id = azurerm_capacity_reservation_group.crg.id
+  zone                          = var.zone
+
+  sku {
+    name     = var.vm_size
+    capacity = var.reserved_count
+  }
+}
+
+# In generated.tf, change the imported VM's line
+#     capacity_reservation_group_id = null
+# to
+#     capacity_reservation_group_id = azurerm_capacity_reservation_group.crg.id
+# and add   depends_on = [azurerm_capacity_reservation.res]   so destroy removes the VM association
+# before the reservation (otherwise Azure returns 409).

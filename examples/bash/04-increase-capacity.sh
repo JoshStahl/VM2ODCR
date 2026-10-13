@@ -2,25 +2,22 @@
 # Step 4b: Increase the reservation quantity to cover the running VM (behavior #3).
 #
 # Because the VM is already running, it already owns a hypervisor slot, so Azure can
-# link the reservation to that existing slot. On a standard subscription with capacity,
-# this succeeds and the VM becomes PROTECTED.
+# link the reservation to that existing slot. Per Microsoft Learn, this step needs no
+# additional quota or capacity once the VM is associated and allocated.
 #
-# Real-world note: this is the step that can fail with `SkuNotAvailable` /
-# "Capacity Restrictions" if there is no real capacity to allocate, or if the
-# subscription type (e.g. sponsored / MngEnv* lab subs) is restricted from allocating
-# ODCR capacity. Retrying off-hours, or choosing another zone/size/region, can help.
+# If it fails with `SkuNotAvailable` ("Capacity Restrictions"), do NOT conclude the
+# subscription type is blocked. First run ./05-verify.sh and confirm the reservation's
+# region, zone and size match the VM and that the VM is in virtualMachinesAllocated.
+# In our lab this step failed (D2s_v5, eastus2, zone 1) even though those matched; in a
+# reviewer's sponsored POC subscription the same step succeeded. Cause was not isolated.
 set -euo pipefail
 source "$(dirname "$0")/00-vars.sh"
 
+TARGET="${TARGET_CAPACITY:-1}"
+
 az capacity reservation update \
   -g "$RG" -c "$CRG_NAME" -n "$RES_NAME" \
-  --capacity 1 \
+  --capacity "$TARGET" \
   -o table
 
-echo "Reservation $RES_NAME raised to capacity 1. VM is now protected."
-
-echo "--- Verify ---"
-az capacity reservation group show -g "$RG" -n "$CRG_NAME" \
-  --query "{crg:name, zones:zones, vmsAssociated:virtualMachinesAssociated[].id}" -o json
-az capacity reservation show -g "$RG" -c "$CRG_NAME" -n "$RES_NAME" \
-  --query "{res:name, sku:sku.name, capacity:sku.capacity, zone:zones[0]}" -o json
+echo "Reservation $RES_NAME capacity set to $TARGET. Run ./05-verify.sh to confirm protection."

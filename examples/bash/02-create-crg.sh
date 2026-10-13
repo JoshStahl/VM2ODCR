@@ -4,18 +4,21 @@
 set -euo pipefail
 source "$(dirname "$0")/00-vars.sh"
 
+ZONES_ARGS=(); ZONE_ARGS=()
+[[ -n "$ZONE" ]] && { ZONES_ARGS=(--zones "$ZONE"); ZONE_ARGS=(--zone "$ZONE"); }
+
 # Step 2 — the "bucket": name + region + zones
 az capacity reservation group create \
   -g "$RG" -n "$CRG_NAME" \
   -l "$LOCATION" \
-  --zones "$ZONE" \
+  ${ZONES_ARGS[@]+"${ZONES_ARGS[@]}"} \
   -o table
 
 # Step 3 — the reservation inside the CRG, starting at capacity 0
 az capacity reservation create \
   -g "$RG" -c "$CRG_NAME" -n "$RES_NAME" \
   --sku "$VM_SIZE" \
-  --zone "$ZONE" \
+  ${ZONE_ARGS[@]+"${ZONE_ARGS[@]}"} \
   --capacity 0 \
   -o table
 

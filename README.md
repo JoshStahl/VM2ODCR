@@ -1,142 +1,165 @@
 # VM2ODCR — Adding an existing Azure VM to an On-Demand Capacity Reservation (ODCR)
 
-This repo documents, with working code, how to:
+Working, tested code for protecting a VM with an On-Demand Capacity Reservation, in **Azure CLI
+(bash)**, **PowerShell (Az)**, **Terraform** (`azurerm` and `azapi`) and **Bicep**, following the
+low-risk pattern from
+[Demystifying On-Demand Capacity Reservations](https://techcommunity.microsoft.com/blog/azureinfrastructureblog/demystifying-on-demand-capacity-reservations/4504806).
 
-1. Build a small VM.
-2. Build a Capacity Reservation Group (CRG) and a Capacity Reservation inside it.
-3. Associate an **existing** VM with the CRG — using the low‑risk pattern described in
-   [Demystifying On-Demand Capacity Reservations](https://techcommunity.microsoft.com/blog/azureinfrastructureblog/demystifying-on-demand-capacity-reservations/4504806).
-
-Code is provided in **Azure CLI (bash)**, **PowerShell (Az)**, **Terraform** (both `azurerm`
-and `azapi`), and **Bicep**.
+> **Status of this repo.** Examples were run against a real subscription unless the table in
+> [What was tested](#what-was-tested) says otherwise. One step could not be completed in our lab:
+> raising a reservation from 0 to 1 failed with `SkuNotAvailable`. See
+> [Capacity and `SkuNotAvailable`](#capacity-and-skunotavailable).
 
 ---
 
 ## Concepts (the "parking garage")
 
-- An **ODCR** reserves a hypervisor slot ("parking space") for a specific **VM size**, in a
-  specific **region** and **availability zone**. A VM associated with it gets priority on
-  start and a formal startup SLA.
-- An ODCR has two parts:
-  - **Capacity Reservation Group (CRG)** — a "bucket". Only needs a **name**, **region**, and
-    the **zones** it may use.
-  - **Capacity Reservation** — created inside the CRG. Needs a **name**, the **VM size**, the
-    **zone**, and the **quantity** (number of instances / "parking spaces").
-- **Associated vs. Allocated**: a VM linked to a CRG is *associated*. The number of parking
-  spaces the reservation holds is its *allocated capacity*. You can associate more VMs than you
-  have allocated — this is **overallocation**, and the extra VMs are not protected until you
-  raise the capacity.
+- An **ODCR** reserves a hypervisor slot for a specific **VM size**, **region** and **zone**. A VM
+  associated with it gets priority on start and a capacity SLA.
+- A **Capacity Reservation Group (CRG)** is a bucket (name, region, zones). A **capacity reservation**
+  inside it has a VM size, zone and **quantity**.
+- **Associated vs. allocated.** *Associated* = the VM references the CRG. *Allocated* = the VM is
+  consuming a reserved slot. A reservation with fewer slots than associated VMs is **overallocated**;
+  the extra VMs are not protected.
 
 ### The three behaviors that make protecting existing VMs easy
 
 1. You can add a **running** VM to a CRG.
-2. You can create a reservation with a quantity of **zero** (pure metadata — it always succeeds).
-3. If associated VMs > allocated capacity, you can **increase** the capacity to cover the running
-   VMs, because a running VM already owns a hypervisor slot.
+2. You can create a reservation with quantity **0** (metadata only, needs no capacity).
+3. If associated VMs exceed the reserved quantity, you can **increase** the quantity to cover them,
+   because a running VM already owns a slot.
 
-### The recommended order for existing VMs (lowest risk)
+### Recommended order for an existing VM
 
-> Bring the VMs online first, then apply the reservation.
+> Bring the VM online first, then apply the reservation.
 
-1. Create the CRG + a reservation with **quantity 0** (behavior #2).
-2. **Associate** the running VM(s) to the CRG (behavior #1). The CRG is now overallocated.
-3. **Increase** the reservation quantity to match the number of running VMs (behavior #3).
+1. Create the CRG and a reservation with **quantity 0**.
+2. **Associate** the running VM. The reservation is now overallocated (VM not yet protected).
+3. **Raise** the quantity to the number of VMs.
+4. **Verify** (below). Only then call the VM protected.
 
 ### Disruption when associating
 
-- VM **not running** → change applies immediately.
-- VM **running + zonal** (has a zone) → change is **immediate and nondisruptive**.
-- VM **running + regional** (no zone) → VM must be **stopped and restarted** to apply.
+| VM | Behavior |
+|---|---|
+| Not running | Applies immediately |
+| Running, **zonal** | No deallocation needed. Microsoft Learn currently labels this **Preview** |
+| Running, **regional** (no zone) | Must be reallocated: deallocate, set the property, start |
 
----
+We confirmed that a REST `PATCH` on a **running zonal** VM succeeded and the VM stayed `running`.
 
-## ⚠️ Important note for Terraform users (`azurerm` vs `azapi`)
+## Verify before you say "protected"
+
+Association alone is not protection. Check all of the following (`examples/bash/05-verify.sh` does):
+
+- The reservation's **region, zone and size** match the VM.
+- `sku.capacity` (the reserved quantity) is at least the number of associated VMs.
+- `instanceView.utilizationInfo.currentCapacity` reflects that capacity.
+- The VM appears in `instanceView.utilizationInfo.virtualMachinesAllocated`, not just in
+  `virtualMachinesAssociated`.
+
+```bash
+az capacity reservation show -g <rg> -c <crg> -n <reservation> --instance-view \
+  --query "{capacity:sku.capacity, current:instanceView.utilizationInfo.currentCapacity, allocated:instanceView.utilizationInfo.virtualMachinesAllocated[].id}"
+```
+
+In our runs `virtualMachinesAllocated` was sometimes empty immediately after association and populated
+later, so allow a short delay before concluding anything.
+
+## Capacity and `SkuNotAvailable`
+
+Creating or raising a reservation to more than 0 asks Azure for real capacity, and this can fail with
+`SkuNotAvailable` ("failed for Capacity Restrictions"). Quantity 0 never needs capacity.
+
+**What we observed.** In our lab subscription (a `MngEnv` sponsored subscription), raising a reservation
+from 0 to 1 failed for `Standard_D2s_v5` in eastus2 zone 1, even though the VM was running in that zone,
+the reservation matched its size and zone, and `az vm list-skus` showed only zone 2 as restricted.
+A probe across D, E and F families (v3 to v5), zones 1 and 3, and a regional reservation also returned
+`SkuNotAvailable` every time. A reviewer ran the same step in their **own sponsored POC subscription
+and it succeeded.**
+
+**What that does and does not show.** It shows allocation was blocked for that one lab subscription. It
+does **not** show that sponsored subscriptions in general cannot allocate reservations. Microsoft Learn's
+only stated exclusion is Free Trial and Azure for Students subscriptions. We did not isolate the cause.
+
+**What to do if you hit it.** Verify the region, zone and size match and that the VM is allocated (above)
+before interpreting the error. Then try another size, zone or region, retry off-hours, and check quota.
+If it persists, open a support request. The article lists the same remedies.
+
+## ⚠️ Terraform: `azurerm` stops the VM, `azapi` does not
 
 Per the source article:
 
-> There is a critical behavior difference between the **AzureRM** provider and the **Azapi**
-> provider. If you use the **AzureRM** provider, Terraform will always perform an immediate
-> **stop/deallocate of the VM, apply the change, and then start the VM again**. The **Azapi**
-> provider works as documented (nondisruptive for a running zonal VM). This is a result of how
-> HashiCorp coded the AzureRM provider to manage Azure resources.
+> If you use the **AzureRM** provider, Terraform will always perform an immediate **stop/deallocate of
+> the VM, apply the change, and then start the VM up again**. The **Azapi** provider works as documented.
+> I believe this is a result of how HashiCorp coded the AzureRM provider to manage Azure resources.
 
-In practice, setting `capacity_reservation_group_id` on an existing `azurerm_linux_virtual_machine`
-(or `azurerm_windows_virtual_machine`) triggers that **deallocate → update → start** cycle. If you
-need a zero-downtime association for a running **zonal** VM, use the **`azapi`** approach (a targeted
-`PATCH` of `properties.capacityReservation`) instead. See
-[`examples/terraform/azurerm`](examples/terraform/azurerm) and
-[`examples/terraform/azapi`](examples/terraform/azapi).
+We observed the cost of this: adopting a running VM took **1m17s** with `azurerm` versus **12s** with an
+`azapi` PATCH. To avoid the stop/start for an existing zonal VM, use the `azapi` approach.
+
+### Terraform prerequisite
+
+Terraform plans stalled in provider registration in a reviewer's environment. Set this before
+`terraform init/plan/apply`:
+
+```bash
+export ARM_RESOURCE_PROVIDER_REGISTRATIONS=none
+```
+
+This is an environment prerequisite (the identity may lack permission to register providers), not a
+template defect. All Terraform tests here ran with it set.
 
 ---
 
-## What was actually built in the lab
+## Examples
 
-| Resource | Name | Details |
+Fresh builds create a new VM already associated. **Adoption** examples protect a VM that already exists.
+
+| Tool | Fresh build | Adopt an existing VM |
 |---|---|---|
-| Resource group | `rg-vm2odcr-lab` | `eastus2` |
-| VM | `vm-odcr-demo` | `Standard_D2s_v5`, **zone 1**, Ubuntu 22.04, no public IP |
-| Capacity Reservation Group | `crg-vm2odcr` | `eastus2`, zone 1 |
-| Capacity Reservation | `res-D2s_v5-z1` | `Standard_D2s_v5`, zone 1, **capacity 0** |
-| Association | — | `vm-odcr-demo` associated with `crg-vm2odcr` ✅ |
+| Azure CLI (bash) | [`examples/bash`](examples/bash) (script 01 creates a test VM; 02 to 05 work on any VM) | same scripts |
+| PowerShell (Az) | [`examples/powershell`](examples/powershell) | same script |
+| Terraform `azurerm` | [`examples/terraform/azurerm`](examples/terraform/azurerm) | [`examples/terraform/adopt-azurerm`](examples/terraform/adopt-azurerm) (import; restarts the VM) |
+| Terraform `azapi` | [`examples/terraform/azapi`](examples/terraform/azapi) | [`examples/terraform/adopt-azapi`](examples/terraform/adopt-azapi) (**recommended**; no import) |
+| Bicep | [`examples/bicep/main.bicep`](examples/bicep/main.bicep) | [`examples/bicep/adopt-existing.bicep`](examples/bicep/adopt-existing.bicep) |
 
-### Two real-world gotchas we hit (and how we handled them)
+All fresh-build examples default to a reservation quantity of **0**, matching the recommended order.
+Raise it in a second step (`reserved_count=1`, `reservedCount=1`, `TARGET_CAPACITY=1`, `-TargetCapacity 1`).
 
-1. **`az vm update --capacity-reservation-group` failed with**
-   `Operation 'Enabling zone movement' is not supported...`.
-   The CLI issues a *full PUT* of the VM that includes its `zones`, which ARM misinterprets as a
-   zone-movement request. **Workaround:** use a targeted REST `PATCH` that sets only
-   `properties.capacityReservation` (no `zones` in the body). This is shown in
-   [`examples/bash/03-associate-vm.sh`](examples/bash/03-associate-vm.sh).
+## What was tested
 
-2. **Raising the reservation quantity 0 → 1 failed with** `SkuNotAvailable` /
-   *"failed for Capacity Restrictions"*.
-   This is the **real capacity failure mode** the article describes: allocating a reservation
-   requires Azure to find real hardware. Sponsored / `MngEnv*` lab subscriptions are frequently
-   **restricted from allocating ODCR capacity** (we confirmed the same failure in multiple
-   zones and regions). Everything *management-plane* works (CRG, reservation, association); only
-   the actual hardware allocation is blocked on this subscription type. On a standard
-   subscription with available capacity, step 3 (raise the quantity) completes the protection.
+Real Azure subscription, eastus2, zone 1, `Standard_D2s_v5`, reservation quantity 0 unless noted.
 
----
-
-## Step-by-step
-
-Pick your tool and follow the matching example folder. Each one performs the same four steps:
-
-1. Create the VM (small, zonal).
-2. Create the CRG.
-3. Create a reservation with **quantity 0**.
-4. Associate the VM, then raise the quantity to 1.
-
-| Tool | Folder |
+| Example | Result |
 |---|---|
-| Azure CLI (bash) | [`examples/bash`](examples/bash) |
-| PowerShell (Az) | [`examples/powershell`](examples/powershell) |
-| Terraform (`azurerm`) | [`examples/terraform/azurerm`](examples/terraform/azurerm) |
-| Terraform (`azapi`, nondisruptive) | [`examples/terraform/azapi`](examples/terraform/azapi) |
-| Bicep | [`examples/bicep`](examples/bicep) |
-
----
+| bash 01 to 03, 05, 99 | Passed. Verify correctly reports "NOT protected" at quantity 0. Cleanup finished in one pass |
+| PowerShell | **Not run live** (Az PowerShell needed interactive MFA we could not complete). Every cmdlet and parameter in the script was validated against the installed Az.Compute 11.6; `-Sku` is a string and `-Location`, `-CapacityToReserve` are mandatory |
+| Terraform `azurerm` fresh | apply, clean plan, single-pass destroy |
+| Terraform `azapi` fresh | apply, clean plan (needs `ignore_casing`), single-pass destroy (needs `retry` on the CRG) |
+| Terraform `adopt-azapi` | apply, clean plan, VM kept tags/config and stayed running; single-pass destroy left the VM running and detached |
+| Terraform `adopt-azurerm` | import, in-place association, clean plan, and the safe-undo path. A plain `destroy` **deletes the VM** |
+| Bicep fresh | deploy, idempotent redeploy, names derived from `vmName` |
+| Bicep adopt | what-if, deploy; identity, boot diagnostics and tags preserved, VM stayed running |
+| **Raising quantity 0 to 1** | **Failed (`SkuNotAvailable`) in our lab**, see above. Not tested successfully anywhere in this repo |
 
 ## Cleanup
 
-Delete everything created in the lab:
+Azure rejects deleting a reservation (`409`) while a VM still references it, and a just-deleted
+reservation can briefly still be listed as nested under its CRG. Delete the VM (or detach it) first, then
+the reservation, then the CRG. Deleting the whole resource group handles the order:
 
 ```bash
-az group delete -n rg-vm2odcr-lab --yes --no-wait
+az group delete -n <rg> --yes --no-wait
 ```
 
-A reservation with quantity > 0 **bills immediately** (same rate as a running VM of that size),
-so remove it when you're done experimenting. Deleting the resource group removes the VM, CRG, and
-reservation together. (A reservation must have no associated running VMs / be emptied before the CRG
-can be deleted independently; deleting the whole RG handles ordering for you.)
+A reservation with quantity above 0 **bills immediately** at the VM's rate, so remove it when finished.
 
 ---
 
 ## References
 
-- [On-Demand Capacity Reservations overview](https://learn.microsoft.com/azure/virtual-machines/capacity-reservation-overview)
-- [Associate a VM to a capacity reservation](https://learn.microsoft.com/azure/virtual-machines/capacity-reservation-associate-virtual-machine)
-- [Overallocating capacity reservations](https://learn.microsoft.com/azure/virtual-machines/capacity-reservation-overallocate)
+- [On-demand capacity reservation overview](https://learn.microsoft.com/azure/virtual-machines/capacity-reservation-overview)
+- [Associate a VM to a capacity reservation group](https://learn.microsoft.com/azure/virtual-machines/capacity-reservation-associate-vm)
+- [Remove a VM association](https://learn.microsoft.com/azure/virtual-machines/capacity-reservation-remove-vm)
+- [Overallocate capacity reservations](https://learn.microsoft.com/azure/virtual-machines/capacity-reservation-overallocate)
 - [Demystifying On-Demand Capacity Reservations (blog)](https://techcommunity.microsoft.com/blog/azureinfrastructureblog/demystifying-on-demand-capacity-reservations/4504806)
-

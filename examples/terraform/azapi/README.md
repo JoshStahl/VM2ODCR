@@ -1,25 +1,41 @@
-# Terraform — `azapi` provider (nondisruptive)
+# Terraform — `azapi`, FRESH BUILD
 
-Creates the CRG + reservation and **associates** the VM with a targeted `PATCH`
-(`azapi_update_resource`) of `properties.capacityReservation`. For a running **zonal** VM
-this is **immediate and nondisruptive** — no stop/start — unlike the `azurerm` approach.
+Builds a **new** VM (with azurerm), then creates the CRG and reservation and associates the VM with
+azapi (`azapi_update_resource`, a PATCH of `properties.capacityReservation`). This does **not** adopt an
+existing VM; for that use [`../adopt-azapi`](../adopt-azapi).
+
+> Zonal association without deallocation is a Microsoft Learn **Preview** feature. The azapi provider
+> sends the PATCH directly, so the VM is not stopped (unlike `azurerm`).
 
 ## Usage
 
 ```bash
+export ARM_RESOURCE_PROVIDER_REGISTRATIONS=none     # see top-level README prerequisite
 terraform init
+
+# reserved_count defaults to 0: the VM is associated but NOT yet protected
 terraform apply -var="ssh_public_key=$(cat ~/.ssh/id_rsa.pub)"
+
+# then raise capacity and VERIFY (top-level README) before calling the VM protected
+terraform apply -var="ssh_public_key=$(cat ~/.ssh/id_rsa.pub)" -var="reserved_count=1"
 ```
 
-### Low-risk pattern for an existing VM
+## What was tested
 
-1. Apply with `-var="reserved_count=0"` — reservation is metadata only, VM gets associated.
-2. Apply with `-var="reserved_count=1"` — allocates real capacity and protects the VM.
+Fresh build with `reserved_count = 0`, eastus2 zone 1, `Standard_D2s_v5`:
 
-> `reserved_count > 0` **bills immediately** at the VM's compute rate.
+| Check | Result |
+|---|---|
+| `apply` | 8 resources |
+| `plan` after apply | **clean** with `ignore_casing = true` |
+| `plan` after apply, flag removed | **drift**: another PATCH proposed solely to change `RG-...` (upper case, as Azure echoes it) to `rg-...` |
+| `destroy` | **single pass**, 8 destroyed |
 
-## Why this is nondisruptive
+Two things make destroy work in one pass:
 
-The `azapi` provider issues the exact REST `PATCH` that Azure documents for associating a
-capacity reservation. Azure applies it in place for a running **zonal** VM. A running
-**regional** (zoneless) VM still requires a stop/start for the change to take effect.
+1. The VM has `depends_on = [azapi_resource.res]`, so the VM is deleted before the reservation.
+2. The CRG has a `retry` on `CannotDeleteResource`. Even after the reservation delete reports success,
+   Azure can briefly still list it as a nested resource. Before the retry, the first `destroy` failed
+   with a 409 on the CRG and a second `destroy` succeeded.
+
+`reserved_count = 1` was not tested here (see the top-level README).

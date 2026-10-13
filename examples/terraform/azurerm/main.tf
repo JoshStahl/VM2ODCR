@@ -8,7 +8,16 @@
 #     It is a function of how the azurerm provider manages the VM resource, NOT a
 #     property of Azure/ARM itself. For a zero-downtime association of a running
 #     ZONAL VM, use the `azapi` example in ../azapi instead.
+#
+# Ordering: the VM depends_on the reservation. Terraform therefore CREATES the reservation
+# first and DESTROYS the VM first. Without that edge both are deleted in parallel and Azure
+# returns 409 because the VM still references the reservation.
 # =============================================================================
+
+locals {
+  crg_name = "crg-${var.vm_name}"
+  res_name = "res-${replace(var.vm_size, "Standard_", "")}-z${var.zone}"
+}
 
 resource "azurerm_resource_group" "rg" {
   name     = var.resource_group_name
@@ -44,18 +53,18 @@ resource "azurerm_network_interface" "nic" {
 
 # --- Capacity Reservation Group (the bucket) --------------------------------
 resource "azurerm_capacity_reservation_group" "crg" {
-  name                = "crg-vm2odcr"
+  name                = local.crg_name
   resource_group_name = azurerm_resource_group.rg.name
   location            = azurerm_resource_group.rg.location
   zones               = [var.zone]
 }
 
 # --- Capacity Reservation (the actual parking spaces) -----------------------
-# For a brand-new build, Terraform will create the reservation at `reserved_count`.
-# For the low-risk EXISTING-VM pattern you would create this at 0, associate, then
-# bump `reserved_count` in a second apply.
+# Applied at `reserved_count` (default 0). Raise it with a second apply once the VM is
+# associated, then verify currentCapacity and virtualMachinesAllocated before calling the
+# VM protected (see the top-level README).
 resource "azurerm_capacity_reservation" "res" {
-  name                          = "res-D2s_v5-z1"
+  name                          = local.res_name
   capacity_reservation_group_id = azurerm_capacity_reservation_group.crg.id
   zone                          = var.zone
 
@@ -77,6 +86,9 @@ resource "azurerm_linux_virtual_machine" "vm" {
 
   # ⚠️ This association triggers a deallocate -> update -> start cycle on apply.
   capacity_reservation_group_id = azurerm_capacity_reservation_group.crg.id
+
+  # Create the reservation before the VM; destroy the VM before the reservation (avoids 409).
+  depends_on = [azurerm_capacity_reservation.res]
 
   admin_ssh_key {
     username   = var.admin_username

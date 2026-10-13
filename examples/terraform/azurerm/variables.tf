@@ -34,9 +34,9 @@ variable "ssh_public_key" {
   description = "SSH public key for the VM admin user."
 }
 
-# The quantity of reserved instances (parking spaces).
-# Start at 0 for a metadata-only reservation, then raise to cover running VMs.
+# Reserved instances ("parking spaces"). Default 0 = metadata-only, matching the recommended
+# sequence: apply at 0, confirm association, then apply again with -var=reserved_count=1.
 variable "reserved_count" {
   type    = number
-  default = 1
+  default = 0
 }

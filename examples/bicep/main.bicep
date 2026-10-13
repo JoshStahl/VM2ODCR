@@ -1,15 +1,12 @@
 // =============================================================================
-// VM2ODCR — Bicep: VM + Capacity Reservation Group + reservation, with association.
+// VM2ODCR — Bicep FRESH BUILD: VM + Capacity Reservation Group + reservation, associated.
 //
-// A VM is linked to a CRG by setting:
-//   properties.capacityReservation.capacityReservationGroup.id
+// This template CREATES a new VM that is born associated with the CRG. It does NOT adopt an
+// existing VM: redeploying a VM resource means restating its whole configuration, and a mismatch
+// can fail or change the VM. To protect a VM that already exists, see ./adopt-existing.bicep.
 //
-// For an EXISTING VM, deploy this template referencing that VM's current config with
-// the capacityReservation block added. For a running ZONAL VM the change is immediate
-// and nondisruptive; a running REGIONAL VM must be stopped/started to apply.
-//
-// Low-risk pattern: deploy the reservation with `reservedCount = 0`, then redeploy
-// with `reservedCount = 1` after the VM is associated.
+// Recommended sequence: deploy with reservedCount = 0 (default), confirm the association, then
+// redeploy with reservedCount = 1 and verify currentCapacity and virtualMachinesAllocated.
 // =============================================================================
 
 @description('Azure region.')
@@ -18,10 +15,10 @@ param location string = resourceGroup().location
 @description('Availability zone for the VM and reservation.')
 param zone string = '1'
 
-@description('VM name.')
+@description('VM name. CRG, reservation, vnet and NIC names are derived from it so deployments do not collide.')
 param vmName string = 'vm-odcr-demo'
 
-@description('VM size. NOTE: burstable B-series is NOT eligible for ODCR.')
+@description('VM size. Check the supported-size list in the ODCR overview.')
 param vmSize string = 'Standard_D2s_v5'
 
 @description('Admin username.')
@@ -30,15 +27,15 @@ param adminUsername string = 'azureuser'
 @description('SSH public key for the admin user.')
 param sshPublicKey string
 
-@description('Number of reserved instances (parking spaces). Start at 0, then raise to protect running VMs.')
-param reservedCount int = 1
+@description('Reserved instances ("parking spaces"). Default 0 = metadata only; raise to 1 after the VM is associated.')
+param reservedCount int = 0
 
-var crgName = 'crg-vm2odcr'
-var reservationName = 'res-D2s_v5-z1'
+var crgName = 'crg-${vmName}'
+var reservationName = 'res-${replace(vmSize, 'Standard_', '')}-z${zone}'
 
 // --- Networking (minimal) ---------------------------------------------------
 resource vnet 'Microsoft.Network/virtualNetworks@2024-05-01' = {
-  name: 'vnet-vm2odcr'
+  name: 'vnet-${vmName}'
   location: location
   properties: {
     addressSpace: { addressPrefixes: ['10.42.0.0/16'] }
